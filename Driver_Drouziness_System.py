@@ -4,6 +4,14 @@ import csv
 import numpy as np
 from datetime import datetime
 from pygame import mixer
+import threading
+import pygame
+from queue import Queue, Empty
+
+# -----------------------------
+# Global exit flag
+# -----------------------------
+EXIT_REQUESTED = False
 
 # -----------------------------
 # Initialize Alarm
@@ -99,67 +107,235 @@ def clamp(v, a, b):
     return max(a, min(b, v))
 
 # -----------------------------
-# Animation drawing function
+# PYGAME-based Animation3D Class
 # -----------------------------
-def create_animation_frame(width, height, lane_shift, indicator_on, state_text, speed_value):
-    anim = np.zeros((height, width, 3), dtype=np.uint8)
+class Animation3D(threading.Thread):
+    def __init__(self, width=640, height=480, fps=60):
+        super().__init__(daemon=True)
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.queue = Queue()
+        self.running = False
 
-    # Road background
-    cv2.rectangle(anim, (0, 0), (width, height), (40, 40, 40), -1)
+        # visual state
+        self.state = "normal"
+        self.indicator_on = False
+        self.shift = 0.0
+        self.speed = 100.0
+        self.max_shift = int(self.width * 0.24)
 
-    # Lane markers (vertical dashed)
-    lane_left = int(width * 0.33)
-    lane_right = int(width * 0.66)
-    for y in range(0, height, 40):
-        cv2.line(anim, (lane_left, y), (lane_left, y + 20), (200, 200, 200), 3)
-        cv2.line(anim, (lane_right, y), (lane_right, y + 20), (200, 200, 200), 3)
+        # timers
+        self.phase_start = None
 
-    # Right shoulder
-    shoulder_x = int(width * 0.9)
-    cv2.rectangle(anim, (shoulder_x, 0), (width, height), (60, 60, 60), -1)
-    cv2.putText(anim, "RIGHT SHOULDER", (shoulder_x - 170, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv2.LINE_AA)
+        # durations (tweakable)
+        self.indicator_duration = INDICATOR_DURATION
+        self.lane_change_duration = LANE_CHANGE_DURATION
+        self.decel_duration = DECEL_DURATION
+        self.accel_duration = ACCEL_DURATION
+        self.return_duration = RETURN_DURATION
 
-    # Car drawing
-    car_w, car_h = 110, 60
-    center_x = width // 2
-    base_x = int(center_x - car_w // 2)
-    car_x = int(base_x + lane_shift)
-    car_y = int(height * 0.65)
+    def send_command(self, cmd: dict):
+        self.queue.put(cmd)
 
-    # Body and roof
-    cv2.rectangle(anim, (car_x, car_y), (car_x + car_w, car_y + car_h), (0, 120, 255), -1)
-    cv2.rectangle(anim, (car_x + 15, car_y - 20), (car_x + car_w - 15, car_y + 10), (0, 90, 200), -1)
-    # Wheels
-    cv2.circle(anim, (car_x + 20, car_y + car_h), 10, (20, 20, 20), -1)
-    cv2.circle(anim, (car_x + car_w - 20, car_y + car_h), 10, (20, 20, 20), -1)
+    def _process_commands(self):
+        try:
+            while True:
+                cmd = self.queue.get_nowait()
+                if not isinstance(cmd, dict): 
+                    continue
+                c = cmd.get("cmd", None)
+                if c == "shutdown":
+                    self.running = False
+                elif c == "set_state":
+                    s = cmd.get("state")
+                    if s:
+                        self._enter_state(s)
+                elif c == "force":
+                    if "shift" in cmd:
+                        self.shift = float(cmd["shift"])
+                    if "speed" in cmd:
+                        self.speed = float(cmd["speed"])
+        except Empty:
+            pass
 
-    # Right indicator (blinking)
-    ind_x1 = car_x + car_w - 6
-    ind_y1 = car_y + 10
-    ind_x2 = car_x + car_w + 6
-    ind_y2 = car_y + 25
-    ind_x1 = max(0, min(width - 1, ind_x1))
-    ind_x2 = max(0, min(width - 1, ind_x2))
-    ind_color = (0, 200, 255) if indicator_on else (30, 30, 30)
-    cv2.rectangle(anim, (ind_x1, ind_y1), (ind_x2, ind_y2), ind_color, -1)
+    def _enter_state(self, s):
+        if s == self.state:
+            return
+        self.state = s
+        self.phase_start = time.time()
+        # optionally set indicator
+        if s == "indicator":
+            self.indicator_on = True
+        elif s == "changing_right":
+            self.indicator_on = True
+        else:
+            self.indicator_on = False
 
-    # HUD: state_text top-left
-    cv2.putText(anim, state_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (230, 230, 230), 2, cv2.LINE_AA)
+    def run(self):
+        global EXIT_REQUESTED
+        pygame.init()
+        screen = pygame.display.set_mode((self.width, self.height))
+        pygame.display.set_caption("3D Road Animation - Driver Assist")
+        clock = pygame.time.Clock()
+        font = pygame.font.SysFont("Arial", 20, bold=True)
 
-    # SPEED display top-center
-    speed_text = f"Speed: {int(speed_value):d} km/h"
-    (tw, th), _ = cv2.getTextSize(speed_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-    sx = (width - tw) // 2
-    cv2.putText(anim, speed_text, (sx, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        # pre-draw car surface
+        CAR_W, CAR_H = 140, 80
+        car_surf = pygame.Surface((CAR_W, CAR_H), pygame.SRCALPHA)
+        pygame.draw.rect(car_surf, (10,140,200), (0, 12, CAR_W, CAR_H-12), border_radius=12)
+        pygame.draw.rect(car_surf, (0,90,140), (14, -6, CAR_W-28, CAR_H-22), border_radius=10)
+        pygame.draw.rect(car_surf, (255,240,200), (CAR_W-18, CAR_H//2 - 6, 8, 12), border_radius=3)
 
-    return anim
+        last_time = time.time()
+        self.running = True
+        while self.running and not EXIT_REQUESTED:
+            # Exit handling (allow closing window)
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    self.running = False
+                    EXIT_REQUESTED = True
+
+                # ✅ Stop animation if X key is pressed
+                if ev.type == pygame.KEYDOWN:
+                    if ev.key == pygame.K_x:
+                        self.running = False
+                        EXIT_REQUESTED = True
+
+            # handle external commands
+            self._process_commands()
+
+            now = time.time()
+            dt = now - last_time
+            last_time = now
+
+            # State machine animation
+            if self.state == "indicator":
+                t = now - (self.phase_start or now)
+                # indicator blinks
+                self.indicator_on = (int(now * 2) % 2 == 0)
+                # speed holds
+                self.speed = 100.0
+                # after indicator duration -> move to changing_right
+                if t >= self.indicator_duration:
+                    self._enter_state("changing_right")
+
+            elif self.state == "changing_right":
+                t = now - (self.phase_start or now)
+                progress = clamp(t / self.lane_change_duration, 0.0, 1.0)
+                smooth = ease_out_quad(progress)
+                self.shift = self.max_shift * smooth
+                # decelerate
+                decel_prog = clamp(t / self.decel_duration, 0.0, 1.0)
+                self.speed = 100.0 * (1.0 - decel_prog)
+                if progress >= 1.0 and self.speed <= 1.0:
+                    self.shift = float(self.max_shift)
+                    self.speed = 0.0
+                    self._enter_state("stopped")
+                    # log via queue to main thread if wanted (not implemented here)
+            elif self.state == "stopped":
+                self.shift = float(self.max_shift)
+                self.speed = 0.0
+                self.indicator_on = False
+                # wait until main thread commands 'returning' when driver wakes
+            elif self.state == "returning":
+                t = now - (self.phase_start or now)
+                progress = clamp(t / self.return_duration, 0.0, 1.0)
+                smooth = ease_out_quad(progress)
+                start_shift = getattr(self, "_return_start_shift", self.max_shift)
+                start_speed = getattr(self, "_return_start_speed", 0.0)
+                # interpolate shift back to 0
+                self.shift = start_shift * (1.0 - smooth)
+                # accelerate
+                accel_prog = clamp(t / self.accel_duration, 0.0, 1.0)
+                self.speed = 100.0 * accel_prog
+                if progress >= 1.0:
+                    self.shift = 0.0
+                    self.speed = 100.0
+                    self._enter_state("normal")
+                    self.running = self.running  # keep running, just go to normal
+            else:  # normal
+                # gently ensure values are nominal
+                self.shift += (0.0 - self.shift) * min(1.0, dt * 4.0)
+                self.speed += (100.0 - self.speed) * min(1.0, dt * 1.5)
+                self.indicator_on = False
+
+            # DRAWING
+            screen.fill((20, 20, 30))
+            # draw road perspective (simple trapezoid)
+            van_y = int(self.height * 0.18)
+            road_top_w = int(self.width * 0.28)
+            road_bottom_w = int(self.width * 0.9)
+            top_left = ((self.width - road_top_w) // 2, van_y)
+            top_right = (top_left[0] + road_top_w, van_y)
+            bot_left = ((self.width - road_bottom_w) // 2, self.height)
+            bot_right = (bot_left[0] + road_bottom_w, self.height)
+            pygame.draw.polygon(screen, (50,50,55), [top_left, top_right, bot_right, bot_left])
+
+            # lane markers (draw converging lines)
+            lane_count = 3
+            for i in range(1, lane_count):
+                lerp = i / lane_count
+                sx = int(top_left[0] + (top_right[0]-top_left[0]) * lerp)
+                ex = int(bot_left[0] + (bot_right[0]-bot_left[0]) * lerp)
+                # dashed: draw segments
+                seg_count = 18
+                for s in range(seg_count):
+                    a = s / seg_count
+                    b = (s + 0.6) / seg_count
+                    ay = int(van_y + (self.height - van_y) * a)
+                    by = int(van_y + (self.height - van_y) * b)
+                    ax = int(sx + (ex - sx) * a)
+                    bx = int(sx + (ex - sx) * b)
+                    pygame.draw.line(screen, (220,220,220), (ax, ay), (bx, by), 4)
+
+            # right shoulder
+            shoulder_x = int(bot_right[0] - (self.width * 0.02))
+            pygame.draw.rect(screen, (80,80,80), (shoulder_x, 0, self.width - shoulder_x, self.height))
+
+            # car position (base center of road bottom, then apply shift)
+            car_base_x = self.width // 2
+            car_x = int(car_base_x + self.shift - (car_surf.get_width() // 2))
+            car_y = int(self.height * 0.65)
+            screen.blit(car_surf, (car_x, car_y))
+
+            # indicator arrow if on
+            if self.indicator_on:
+                # draw simple arrow near front-right of car
+                arrow_color = (255, 190, 40) if (int(now*2) % 2 == 0) else (120,80,0)
+                points = [(car_x + CAR_W - 10, car_y + 10),
+                          (car_x + CAR_W + 40, car_y + 30),
+                          (car_x + CAR_W - 10, car_y + 50)]
+                pygame.draw.polygon(screen, arrow_color, points)
+
+            # HUD: state text
+            state_surf = font.render(self.state.upper(), True, (235,235,235))
+            screen.blit(state_surf, (10, 10))
+
+            # speed HUD
+            speed_text = f"Speed: {int(self.speed):03d} km/h"
+            speed_surf = font.render(speed_text, True, (255,255,255))
+            sx = (self.width - speed_surf.get_width()) // 2
+            screen.blit(speed_surf, (sx, 10))
+
+            pygame.display.flip()
+            clock.tick(self.fps)
+
+        pygame.quit()
+
+# Instantiate and start animation thread
+anim = Animation3D(width=CAM_W, height=CAM_H, fps=30)
+anim.start()
 
 # -----------------------------
 # Main loop
 # -----------------------------
 try:
     while True:
+        # break if global exit requested by pygame thread or user
+        if EXIT_REQUESTED:
+            break
+
         ret, frame = cap.read()
         if not ret or frame is None:
             print("WARNING: Failed to grab frame or frame is empty.")
@@ -204,6 +380,7 @@ try:
                     animation_active = True
                     animation_start_time = time.time()
                     animation_state = "indicator"
+                    anim.send_command({"cmd": "set_state", "state": "indicator"})
                     # log
                     with open(csv_file, mode='a', newline='') as file:
                         writer = csv.writer(file)
@@ -235,10 +412,14 @@ try:
                     # start returning sequence from current_shift & current_speed
                     animation_state = "returning"
                     animation_start_time = time.time()
+                    # tell animation to return: capture current shift & speed in animation thread by forcing values
+                    anim.send_command({"cmd": "set_state", "state": "returning"})
+                    # also capture start shift/speed in animation thread (it reads current shift/speed internally)
                 else:
                     # ensure normal state
                     animation_state = "normal"
                     animation_active = False
+                    anim.send_command({"cmd": "set_state", "state": "normal"})
 
             COUNTER_START = None
 
@@ -246,116 +427,60 @@ try:
         if VIDEO_RECORDING and out is not None:
             out.write(frame)
 
-        # -----------------------------
-        # Animation state machine update
-        # -----------------------------
-        now = time.time()
-
-        # Default flags
-        indicator_on = False
-
-        if animation_active:
-            # If currently in indicator phase
-            if animation_state == "indicator":
-                t = now - animation_start_time
-                # Blink indicator
-                indicator_on = (int(now * 2) % 2 == 0)
-                # Speed remains normal until lane change begins (optionally can start decel here)
-                # If driver wakes up during indicator, we'll handle in above eyes_detected block which sets state to 'returning'
-                if t >= INDICATOR_DURATION:
-                    # proceed to lane change
-                    animation_state = "changing_right"
-                    # mark starting time for change & deceleration
-                    animation_start_time = now
-                    # store initial speed (should be 100)
-                    start_speed_for_decel = current_speed
-
-            elif animation_state == "changing_right":
-                t = now - animation_start_time
-                progress = clamp(t / LANE_CHANGE_DURATION, 0.0, 1.0)
-                smooth = ease_out_quad(progress)
-                current_shift = int(max_shift_pixels * smooth)
-
-                # decelerate speed over DECEL_DURATION (start at changing start)
-                decel_progress = clamp(t / DECEL_DURATION, 0.0, 1.0)
-                current_speed = 100.0 * (1.0 - decel_progress)  # linear decel, you can ease if desired
-                current_speed = clamp(current_speed, 0.0, 100.0)
-
-                indicator_on = (int(now * 3) % 2 == 0)  # keep blinking faster while changing
-
-                # if completed movement and speed nearly zero -> stopped
-                if progress >= 1.0 and current_speed <= 1.0:
-                    current_shift = max_shift_pixels
-                    current_speed = 0.0
-                    animation_state = "stopped"
-                    # hold stopped until driver recovers
-                    # log event
-                    with open(csv_file, mode='a', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow([datetime.now().strftime("%H:%M:%S"), "AutoStoppedOnShoulder", ""])
-            elif animation_state == "stopped":
-                # hold stopped; speed stays 0 until driver wakes -> handled in eyes_detected change which switches to 'returning'
-                current_shift = max_shift_pixels
-                current_speed = 0.0
-                indicator_on = False
-
-            elif animation_state == "returning":
-                # returning to center from current_shift
-                t = now - animation_start_time
-                progress = clamp(t / RETURN_DURATION, 0.0, 1.0)
-                smooth = ease_out_quad(progress)
-                # compute shift interpolating from current value at start to 0
-                # But we need initial_shift at the moment return started - capture it by computing based on how far we are
-                # To keep simple, compute shift_target by linear interpolation from wherever we currently are at return start.
-                # We'll approximate by using current_shift as the start and easing toward 0:
-                start_shift = current_shift if current_shift != 0 else max_shift_pixels  # fallback
-                current_shift = int(start_shift * (1.0 - smooth))
-
-                # accelerate speed up from current_speed (likely 0) to 100 over ACCEL_DURATION
-                accel_progress = clamp(t / ACCEL_DURATION, 0.0, 1.0)
-                current_speed = 100.0 * accel_progress
-                current_speed = clamp(current_speed, 0.0, 100.0)
-
-                indicator_on = False
-
-                # When fully returned
-                if progress >= 1.0 and current_shift <= 1:
-                    current_shift = 0
-                    current_speed = 100.0
-                    animation_state = "normal"
-                    animation_active = False
-                    # log resume
-                    with open(csv_file, mode='a', newline='') as file:
-                        writer = csv.writer(file)
-                        writer.writerow([datetime.now().strftime("%H:%M:%S"), "AutoReturnCompleted", ""])
-        else:
-            # Normal driving visuals
-            current_shift = 0.0
-            current_speed = 100.0
-            animation_state = "normal"
-            indicator_on = False
-
-        # Make sure variables are numeric and clamped
-        current_shift = float(clamp(current_shift, 0.0, max_shift_pixels))
-        current_speed = float(clamp(current_speed, 0.0, 100.0))
-
-        # Create animation frame
-        anim_frame = create_animation_frame(CAM_W, CAM_H, lane_shift=int(current_shift),
-                                            indicator_on=indicator_on, state_text=animation_state.upper(),
-                                            speed_value=current_speed)
+        # Animation state transitions driven by main loop times
+        # When animation was started, switch to changing_right after INDICATOR_DURATION
+        if animation_active and animation_state == "indicator":
+            if time.time() - animation_start_time >= INDICATOR_DURATION:
+                animation_state = "changing_right"
+                animation_start_time = time.time()
+                anim.send_command({"cmd": "set_state", "state": "changing_right"})
+        # when changing_right completes (we approximate by LANE_CHANGE_DURATION), tell anim to stop
+        if animation_active and animation_state == "changing_right":
+            if time.time() - animation_start_time >= LANE_CHANGE_DURATION:
+                animation_state = "stopped"
+                anim.send_command({"cmd": "set_state", "state": "stopped"})
+                # log stopped
+                with open(csv_file, mode='a', newline='') as file:
+                    writer = csv.writer(file)
+                    writer.writerow([datetime.now().strftime("%H:%M:%S"), "AutoStoppedOnShoulder", ""])
 
         # Show windows
         cv2.imshow("Driver Drowsiness Detection", frame)
-        cv2.imshow("Car Animation", anim_frame)
+        # Note: animation runs in its own Pygame window
 
         key = cv2.waitKey(1) & 0xFF
+
+        # ✅ Quit if user presses X in OpenCV window
+        if key == ord("x"):
+            EXIT_REQUESTED = True
+            break
+
+        # existing q key
         if key == ord("q"):
+            EXIT_REQUESTED = True
+            break
+
+        # quit if pygame triggered shutdown
+        if EXIT_REQUESTED:
             break
 
 finally:
     # cleanup
+    # tell animation thread to shutdown
+    try:
+        anim.send_command({"cmd": "shutdown"})
+    except:
+        pass
+    # set global exit to ensure threads stop
+    EXIT_REQUESTED = True
+    anim.running = False
     cap.release()
     if out is not None:
         out.release()
     cv2.destroyAllWindows()
     mixer.quit()
+    # join anim thread briefly
+    try:
+        anim.join(timeout=1.0)
+    except:
+        pass
